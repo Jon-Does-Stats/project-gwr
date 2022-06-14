@@ -1,0 +1,400 @@
+---
+title: "Individual Research Project - Geographically Weighted Regression"
+author: "Jonathan Schierbaum"
+date: "SPRING 2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+
+packages <- c("knitr", "dplyr", "sp", 
+              "sf", "tmap", "spgwr")
+
+missing <- packages[!(packages %in% installed.packages())]
+
+if(length(missing) > 0) install.packages(missing)
+
+invisible(suppressMessages(lapply(packages, library, character.only = TRUE)))
+```
+
+## Data Description
+
+Our dataset contains major building code violation rates at the census tract level in the City of Philadelphia. 
+The file also contains demographic and socioeconomic neighborhood characteristics from the 2012-2016 American Community Survey. 
+
+The record layout is below.
+
+### Objective
+
+We want to examine the relationship between neighborhood characteristics and major building code violation rates.
+
+### Variables we'll use
+
+* usarea:		  Number of major building code violations per area in square miles 2015-2017
+* lmhhinc:	  Log median household income 2012-2016
+* lpop:		    Log total population 2012-2016  
+* punemp:		  Percent of civilian labor force that are unemployed 2012-2016
+* lmhval:		  Log median housing value 2012-2016
+* pvac:		    Percent of housing units that are vacant 2012-2016
+* ph70:		    Percent of housing units built before 1970 2012-2016
+* phnew:		  Percent of housing units built 2014 and after 2012-2016
+* phisp:		  Percent Hispanic 2012-2016
+* pnhblk:		  Percent non-Hispanic black 2012-2016
+
+**Variables we won't**
+
+* OBJECTID: 	ID
+* STATEFP10:	State FIPS code
+* COUNTYFP10:	County FIPS code
+* TRACTCE10:	Tract FIPS code 
+* GEOID10:	  Complete FIPS tract ID
+* totpop:		  Total population 2012-2016
+* mhhinc:		  Median household income 2012-2016
+* mrent:		  Median monthly rent 2012-2016
+* mhval:		  Median housing value 2012-2016
+* pnhwhite:	  Percent non-Hispanic white 2012-2016
+* pnhasian:	  Percent non-Hispanic Asian 2012-2016
+* pcol:		    Percent with college degree 2012-2016
+* ppa:		    Percent of adults on public assistance 2012-2016
+* ppov:		    Percent below poverty line 2012-2016
+* popd:		    Population density 2012-2016
+
+## Load Data
+```{r load_data}
+fp_raw_data <- "~/GitHub/project-gwr/raw_data/"
+
+fp_figures <- "~/GitHub/project-gwr/figures/"
+
+phil    <- st_read(paste0(fp_raw_data, "phil_tracts.shp"))
+phil.sp <- as(phil, "Spatial")
+
+# note that units are in meters.
+proj4string(phil.sp)
+
+# Our response variable and 9 predictor variables
+formula <- usarea ~ lmhhinc + lpop + pnhblk + 
+                    punemp + pvac  + ph70 + 
+                    lmhval + phnew + phisp
+```
+
+## Ordinary Least Squares (OLS)
+
+Let’s run a basic **Ordinary Least Squares (OLS)** regression on the number of major building code violations per area in square miles (usarea) 
+```{r ols}
+phil.ols <- phil.sp
+
+
+fit.ols <- glm(formula, data = phil.ols) 
+
+summary(fit.ols)
+```
+**We find:**
+
+* the percent of vacant units is positively associated with the number of major building code violations per square mile.
+* the percent of units built before 1970 and log median housing value are negatively associated with the number of major building code violations per square mile. 
+
+
+**But:**
+
+* This model assumes spatial homogeneity in these relationships...is this an appropriate assumption?
+
+### Inspect Residuals
+**Let's check for any spatial patterning in the residuals!**
+```{r residuals}
+phil.ols$resids <- rep(0 , nrow(phil.ols))
+
+resids <- residuals(fit.ols)
+
+names(resids) <- NULL
+
+phil.ols$resids <- resids
+
+png(file=paste0(fp_figures, "spatial_residuals_ols", ".png"), width = 7, height = 5, unit = "in", res = 225, antialias = "cleartype")
+
+
+tm_shape(phil.ols, unit = "km") + 
+  tm_polygons(col = "resids", 
+              midpoint = 0, 
+              n = 4, 
+              title = "Residuals") + 
+  tm_scale_bar(breaks = c(0, 5, 10), 
+               text.size = 0.90, 
+               position = c("right", "bottom")) +
+  tm_layout(main.title = "Residuals By Areal Unit", 
+            main.title.size = 1.5, 
+            outer.margins=c(0, 0, 0, 0), 
+            frame = FALSE, 
+            legend.outside = TRUE)
+dev.off()
+```
+Big chunks of red, big chunks of blue.  The 4 tracts with the largest residuals are close in proximity.  
+
+
+## Introduction: Geographically Weighted Regression (GWR)
+
+Let's explore further with **Geographically Weighted Regression**
+
+**There are two major decisions to make when running a GWR:** 
+
+*(1)* the kernel density function assigning individual weights 
+
+*(2)* the bandwidth h of the kernel function, which determines the degree of distance decay
+
+
+**Choosing a kernel density function:** 
+
+* many to choose from, but recommend you start with two.
+
+* Use Gaussian weighting function when the influence of neighboring features becomes smoothly and gradually less important and there is a distance after which that influence is always present regardless of how far away the surrounding features are.
+
+* Use Bisquare weighting function to specify a distance after which features will have no impact on the regression results. Features outside of the neighborhood specified are assigned zero and do not impact the local regression for the target feature.
+
+* when comparing a Bisquare weighting scheme to a Gaussian weighting scheme with the same neighborhood specifications, weights will decrease more quickly with Bisquare. 
+
+
+**Selecting the bandwidth h of the kernel function:**
+
+* R does this by leave one out cross validation (LOOCV), where R chooses the best h that minimizes the sum of squared errors at all locations.
+
+* You can also select this manually, if you want.
+
+```{r bandwidth_selection}
+phil.gwr <- phil.sp
+
+gwr.b1 <- gwr.sel(formula, phil.gwr)
+
+gwr.b1
+
+# This represents your value h. 
+# The weighting function will search, and include all observations within this radius. 
+# This is the distance in meters, because our data are projected in a system measured in meters, 
+
+
+# change the weighting function (default is Guassian)
+
+gwr.b2 <- gwr.sel(formula, gweight = gwr.bisquare, data = phil.gwr)
+
+gwr.b2
+```
+
+**To adapt, or not to adapt?**
+
+* The GWR models we ran above yielded a fixed distance to search for neighbors to include in the local regression. 
+
+* If the sample points are reasonably regularly spaced in the study area, then a kernel with a fixed bandwidth is a suitable choice for modelling.
+ 
+* If the sample points are clustered in the study area, it is generally desirable to allow the kernel to accommodate this irregularity.
+
+* The bandwidth can adapt as needed, allowing neighborhoods to be smaller where features are dense and larger where features are sparse.
+
+```{r adaptive_bandwidth}
+# adaptive kernel
+gwr.b3 <-gwr.sel(formula, data = phil.gwr, adapt = TRUE)
+
+gwr.b3
+```
+* The weighting function and include this fraction of observations in a model for each tract.
+
+* Instead of a specific distance, the bandwidth is the number of nearest neighbors.
+
+## Build GWR Models
+
+```{r models}
+
+gwr.fit1 <-gwr(formula, 
+               data = phil.gwr, 
+               bandwidth = gwr.b1, 
+               se.fit=T, 
+               hatmatrix=T)
+
+gwr.fit2 <-gwr(formula, 
+               data = phil.gwr, 
+               bandwidth = gwr.b2, 
+               gweight = gwr.bisquare, 
+               se.fit=T, 
+               hatmatrix=T)
+
+gwr.fit3 <-gwr(formula, 
+               data = phil.gwr, 
+               adapt = gwr.b3, 
+               se.fit=T, 
+               hatmatrix=T)
+```
+
+### Investigate Bandwidth Behavior
+
+```{r gwr_bandwidth}
+summary(gwr.fit3$bandwidth)
+
+phil$bwadapt <- gwr.fit3$bandwidth
+
+phil.sp2 <- as(phil, "Spatial")
+
+png(file=paste0(fp_figures, "adaptive_bandwidth", ".png"), width = 7, height = 5, unit = "in", res = 225, antialias = "cleartype")
+
+tm_shape(phil, unit = "km") +
+  tm_polygons(col = "bwadapt", 
+              style = "quantile", 
+              palette = "Reds", 
+              border.alpha = 0, 
+              title = "Distance (m)") +
+  tm_scale_bar(breaks = c(0, 5, 10), 
+               text.size = 1, 
+               position = c("right", "bottom")) +
+  tm_layout(main.title = "GWR Adaptive Bandwidth by Areal Unit", 
+            outer.margins=c(0, 0, 0, 0), 
+            frame = FALSE, 
+            legend.outside = TRUE)
+
+dev.off()
+```
+
+
+## Regression Results
+
+```{r gwr_results}
+# don't use summary!
+gwr.fit3
+
+# notice the global coefficients match our OLS regression
+summary(fit.ols)
+
+# important results are found within SDF
+names(gwr.fit3$SDF)
+
+# the regression coefficients
+names(gwr.fit3$SDF[2:11])
+
+# the coefficient standard errors.
+names(gwr.fit3$SDF[12:21])
+
+results <- as.data.frame(gwr.fit3$SDF[,2:11])
+
+names(results) <- c("X.Int.coef","lmhhinc.coef","lpop.coef",
+                    "pnhblk.coef","punemp.coef","pvac.coef",
+                    "ph70.coef","lmhval.coef","phnew.coef",
+                    "phisp.coef")
+
+phil <- cbind(phil, results)
+```
+**But is the spatial variability in the coefficients significant?**
+
+* The package spgwr has a battery of tests comparing OLS and GWR models. 
+
+* The null in these tests is the OLS.
+
+* A statistically significant test statistic indicates that the GWR provides a statistically significant improvement over an OLS in terms of its ability to match observed values.
+```{r validation}
+# 4 tests compare overall model fit
+BFC02.gwr.test(gwr.fit3)
+BFC99.gwr.test(gwr.fit3)
+LMZ.F1GWR.test(gwr.fit3)
+LMZ.F2GWR.test(gwr.fit3)
+# All show that the GWR shows significant improvement in explanatory power over an OLS.
+
+
+# examines spatial variation in individual coefficients.
+LMZ.F3GWR.test(gwr.fit3)
+```
+The last test shows that the variables percent homes vacant, percent black, and percent of homes built before 1970's indicate statistically significant spatial heterogeneity in its GWR coefficients. 
+
+These results indicate that there is spatial heterogeneity in the relationships between our covariates and major build code violations.
+
+## GWR Plots
+
+Let's look at the spatial distribution of the GWR coefficients for these variables to see the range of variation between the local coefficients.
+```{r gwr_viz}
+png(file=paste0(fp_figures, "spatial_coeff_vacancy", ".png"), width = 7, height = 5, unit = "in", res = 225, antialias = "cleartype")
+
+tm_shape(phil, unit = "km") +
+  tm_polygons(col = "pvac.coef", 
+              style = "quantile", 
+              palette = "Blues", 
+              midpoint = NA,  
+              border.alpha = 0, title = "Percent Vacant Housing Units") +
+  tm_scale_bar(breaks = c(0, 5, 10), 
+               text.size = 0.9, 
+               position = c("right", "bottom")) +
+  tm_layout(main.title = "Coefficient by Areal Unit, Building Code Violation Dependence", 
+            main.title.size = 0.90, 
+            frame = FALSE, 
+            legend.outside = TRUE)
+dev.off()
+
+
+png(file=paste0(fp_figures, "spatial_coeff_oldhomes", ".png"), width = 7, height = 5, unit = "in", res = 225, antialias = "cleartype")
+
+tm_shape(phil, unit = "km") +
+  tm_polygons(col = "ph70.coef", 
+              style = "quantile", 
+              palette = "Greens", 
+              midpoint = NA, 
+              border.alpha = 0, 
+              title = "Percent Housing Units Built Pre-1970") +
+  tm_scale_bar(breaks = c(0, 5, 10), 
+               text.size = 0.9, 
+               position = c("right", "bottom")) +
+  tm_layout(main.title = "Coefficient by Areal Unit, Building Code Violation Dependence", 
+            main.title.size = 0.90, 
+            frame = FALSE, 
+            legend.outside = TRUE)
+dev.off()
+
+
+png(file=paste0(fp_figures, "spatial_coeff_black", ".png"), width = 7, height = 5, unit = "in", res = 225, antialias = "cleartype")
+
+tm_shape(phil, unit = "km") +
+  tm_polygons(col = "pnhblk.coef", 
+              style = "quantile", 
+              palette = "Oranges", 
+              midpoint = NA,
+              border.alpha = 0, 
+              title = "Percent Black") +
+  tm_scale_bar(breaks = c(0, 5, 10), 
+               text.size = 0.9, 
+               position = c("right", "bottom")) +
+  tm_layout(main.title = "Coefficient by Areal Unit, Building Code Violation Dependence", 
+            main.title.size = 0.90, 
+            frame = FALSE, 
+            legend.outside = TRUE)
+dev.off()
+```
+```{r post_residuals}
+phil.resid <- phil
+
+phil.resid$resids <- rep(0 , nrow(phil))
+
+results.sp <- gwr.fit3$SDF
+
+pre <- phil$usarea
+
+post <- results.sp$pred
+
+resids <- pre - post
+
+names(resids) <- NULL
+
+phil.resid$resids <- resids
+
+png(file=paste0(fp_figures, "spatial_residuals_gwr", ".png"), width = 7, height = 5, unit = "in", res = 225, antialias = "cleartype")
+
+tm_shape(phil.resid, unit = "km") + 
+  tm_polygons(col = "resids", 
+              midpoint = 0, 
+              n = 4, 
+              title = "Residuals") + 
+  tm_scale_bar(breaks = c(0, 5, 10), 
+               text.size = 0.90, 
+               position = c("right", "bottom")) +
+  tm_layout(main.title = "Residuals By Areal Unit", 
+            main.title.size = 1.5, 
+            outer.margins=c(0, 0, 0, 0), 
+            frame = FALSE, 
+            legend.outside = TRUE)
+dev.off()
+```
+
