@@ -6,7 +6,7 @@
 ## Primary languages
 - R
 
-## Highlighted Visualizations
+## Highlighted visualizations
 
 ###  OLS residuals
 
